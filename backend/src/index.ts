@@ -1,13 +1,24 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import axios from 'axios';
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 app.use(cors({ origin: 'http://localhost:3000' }));
 app.use(express.json());
 
+// ── MongoDB connection ─────────────────────────────────────────
+mongoose
+  .connect(process.env.MONGODB_URL as string)
+  .then(() => console.log('MongoDB connected'))
+  .catch((err) => console.error('MongoDB connection error:', err));
+
+// ── Yahoo Finance fetch helper ─────────────────────────────────
 const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
@@ -132,8 +143,7 @@ app.post('/api/dashboard', async (req: Request, res: Response) => {
       }
     );
 
-    const symbol =
-      searchResult.data?.quotes?.[0]?.symbol || 'AAPL';
+    const symbol = searchResult.data?.quotes?.[0]?.symbol || 'AAPL';
 
     // Step 2: Parallel execution
     const [chart, marketSummary, trending] = await Promise.all([
@@ -180,5 +190,14 @@ app.post('/api/dashboard', async (req: Request, res: Response) => {
     res.status(500).json({ error: String(error) });
   }
 });
+
+// ── Fan-out feature (BullMQ) ───────────────────────────────────
+import fanoutRouter      from './fanout/router';
+import { createBoard }   from './fanout/board';
+import { startFanoutWorker } from './fanout/worker';
+
+app.use('/api/fanout', fanoutRouter);
+app.use('/admin/queues', createBoard());
+startFanoutWorker();
 
 app.listen(PORT, () => console.log(`YF Explorer backend running on http://localhost:${PORT}`));
