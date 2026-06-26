@@ -99,39 +99,41 @@ POST /api/dashboard  { q, region }
 
 ## Fan-out Feature (BullMQ)
 
-A recursive job queue system at `/fanout` that demonstrates parallel execution at scale.
+A job queue system at `/fanout` that demonstrates parallel vs sequential execution at scale. Takes a region as input and fans out across Trending and Market Summary APIs, then fetches Chart data for every trending symbol in parallel.
 
 ### Execution flow
 
 ```
-POST /api/fanout/start { query }
+POST /api/fanout/start { region }
         ↓
-Level 1 — Search API → resolves query to symbols [AAPL, TSLA, ...]
+Level 1 (parallel) — two jobs enqueued simultaneously:
+    ├── Trending API  → resolves region to ~20 trending symbols
+    └── Market Summary API → market snapshot for the region (leaf)
         ↓
-Level 2 — Chart API for each symbol (parallel, concurrency: 5)
+Level 2 (parallel, rolling window of 5 via BullMQ concurrency) —
+    Chart API for each trending symbol (up to 20 jobs)
         ↓
 Results stored in Redis → written to MongoDB per job as each finishes
         ↓
-Frontend auto-runs sequential comparison:
-Search → Chart → Chart → Chart ... (one by one)
-        ↓
-Both parallel and sequential timings rendered side by side
+Frontend auto-runs sequential comparison first, then parallel fan-out
+Both timings rendered side by side for comparison
 ```
 
 ### Fan-out API endpoints
 
 | Method | URL | What |
 |---|---|---|
-| `POST` | `/api/fanout/start` | Start with `{ query }`, returns `rootJobId` |
+| `POST` | `/api/fanout/start` | Start with `{ region }`, returns `rootJobId` |
 | `GET` | `/api/fanout/status/:rootJobId` | Poll `{ total, completed, done }` |
 | `GET` | `/api/fanout/results/:rootJobId` | All results + timing (202 if still running) |
-| `DELETE` | `/api/fanout/cleanup/:rootJobId` | Remove Redis keys |
+| `DELETE` | `/api/fanout/cleanup/:rootJobId` | Remove Redis keys + obliterate BullMQ queue |
+| `DELETE` | `/api/fanout/records` | Delete all MongoDB fanout records |
 | `POST` | `/api/fanout/sequential` | Run same calls sequentially, returns timing |
 | `GET` | `/admin/queues` | Bull Board visual queue UI |
 
 ### MongoDB storage
 
-Fan-out results are saved to the `fanoutrecords` collection in MongoDB — one document per job, written immediately when each job completes (no waiting for others). Re-running the same query updates existing documents instead of creating duplicates (upsert on `query + key + depth`). Query matching is case-insensitive.
+Fan-out results are saved to the `fanoutrecords` collection — one document per job, written immediately when each job completes (fire-and-forget, never blocks the worker). Re-running the same region updates existing documents instead of creating duplicates (upsert on `query + key + depth`). The `query` field stores the region (lowercased) as the root identifier.
 
 ## Tech Stack
 
