@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { startFanout } from './producer';
 import { getStatus, getAllResults, cleanup, getTiming } from './aggregator';
+import { fanoutQueue } from './queue';
+import { FanoutRecord } from './db';
 
 const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -24,16 +26,15 @@ async function fetchYF(url: string, params: Record<string, string>) {
 
 const router = Router();
 
-// POST /api/fanout/start  { query: "Apple" }
-// → starts the fan-out tree, returns rootJobId immediately
+// POST /api/fanout/start  { query: "Apple", region: "US" }
 router.post('/start', async (req: Request, res: Response) => {
   try {
-    const { query = 'Apple' } = req.body;
-    if (!String(query).trim()) {
-      res.status(400).json({ error: 'query is required' });
+    const { region = 'US' } = req.body;
+    if (!String(region).trim()) {
+      res.status(400).json({ error: 'region is required' });
       return;
     }
-    const rootJobId = await startFanout(String(query).trim());
+    const rootJobId = await startFanout(String(region).trim());
     res.json({ rootJobId, message: 'Fan-out started. Poll /status/:rootJobId for progress.' });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -41,7 +42,6 @@ router.post('/start', async (req: Request, res: Response) => {
 });
 
 // GET /api/fanout/status/:rootJobId
-// → returns { total, completed, done }
 router.get('/status/:rootJobId', async (req: Request, res: Response) => {
   try {
     const status = await getStatus(req.params.rootJobId);
@@ -52,7 +52,6 @@ router.get('/status/:rootJobId', async (req: Request, res: Response) => {
 });
 
 // GET /api/fanout/results/:rootJobId
-// → returns all aggregated results once done
 router.get('/results/:rootJobId', async (req: Request, res: Response) => {
   try {
     const status = await getStatus(req.params.rootJobId);
@@ -71,33 +70,50 @@ router.get('/results/:rootJobId', async (req: Request, res: Response) => {
 });
 
 // DELETE /api/fanout/cleanup/:rootJobId
-// → removes Redis keys for a completed job
 router.delete('/cleanup/:rootJobId', async (req: Request, res: Response) => {
   try {
     await cleanup(req.params.rootJobId);
+    await (fanoutQueue as any).obliterate({ force: true });
     res.json({ message: 'Cleaned up', rootJobId: req.params.rootJobId });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// POST /api/fanout/sequential { query }
-// → runs Search then Chart for each symbol one by one (no parallelism), returns timing
+// DELETE /api/fanout/records
+// → deletes all MongoDB fanout records
+router.delete('/records', async (_req: Request, res: Response) => {
+  try {
+    const result = await FanoutRecord.deleteMany({});
+    res.json({ message: 'All MongoDB records deleted', deletedCount: result.deletedCount });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /api/fanout/sequential { query, region }
+// Runs all calls one by one — same work as the parallel fan-out but with no concurrency
 router.post('/sequential', async (req: Request, res: Response) => {
   try {
-    const { query = 'Apple' } = req.body;
+    const { region = 'US' } = req.body;
 
-    // Level 1 — Search (sequential start)
-    const { data: searchData, timeMs: searchTimeMs } = await fetchYF(
-      'https://query1.finance.yahoo.com/v1/finance/search',
-      { q: query, lang: 'en-US', region: 'US', quotesCount: '5', newsCount: '0' }
+    // Level 1a — Trending
+    const { data: trendingData, timeMs: trendingTimeMs } = await fetchYF(
+      `https://query1.finance.yahoo.com/v1/finance/trending/${encodeURIComponent(region)}`,
+      { lang: 'en-US', region }
+    );
+    const trendingSymbols: string[] = (trendingData?.finance?.result?.[0]?.quotes ?? [])
+      .map((q: { symbol: string }) => q.symbol);
+
+    // Level 1b — Market Summary (sequential — runs after Trending)
+    const { timeMs: mktTimeMs } = await fetchYF(
+      'https://query1.finance.yahoo.com/v6/finance/quote/marketSummary',
+      { lang: 'en-US', region }
     );
 
-    const symbols: string[] = (searchData?.quotes ?? []).map((q: { symbol: string }) => q.symbol);
-
-    // Level 2 — Chart for each symbol one by one
+    // Level 2 — Chart for each trending symbol one by one
     const chartJobs: { key: string; timeMs: number }[] = [];
-    for (const symbol of symbols) {
+    for (const symbol of trendingSymbols) {
       const { timeMs } = await fetchYF(
         `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`,
         { interval: '1d', range: '1mo', lang: 'en-US', region: 'US' }
@@ -105,14 +121,18 @@ router.post('/sequential', async (req: Request, res: Response) => {
       chartJobs.push({ key: symbol, timeMs });
     }
 
-    const level1WallClock = searchTimeMs;
+    const level1Jobs = [
+      { key: `trending:${region}`,      timeMs: trendingTimeMs },
+      { key: `marketSummary:${region}`, timeMs: mktTimeMs },
+    ];
+    const level1WallClock = level1Jobs.reduce((sum, j) => sum + j.timeMs, 0);
     const level2WallClock = chartJobs.reduce((sum, j) => sum + j.timeMs, 0);
 
     res.json({
       totalTimeMs: level1WallClock + level2WallClock,
       levelTimings: [
-        { depth: 1, wallClockMs: level1WallClock, jobCount: 1,             jobs: [{ key: query,  timeMs: searchTimeMs }] },
-        { depth: 2, wallClockMs: level2WallClock, jobCount: chartJobs.length, jobs: chartJobs },
+        { depth: 1, wallClockMs: level1WallClock, jobCount: level1Jobs.length, jobs: level1Jobs },
+        { depth: 2, wallClockMs: level2WallClock, jobCount: chartJobs.length,  jobs: chartJobs },
       ],
     });
   } catch (err) {

@@ -64,7 +64,7 @@ interface FanoutResults {
 
 export default function FanoutPage() {
   const router = useRouter()
-  const [query, setQuery] = useState('Apple')
+  const [region, setRegion] = useState('US')
   const [rootJobId, setRootJobId] = useState<string | null>(null)
   const [status, setStatus] = useState<JobStatus | null>(null)
   const [results, setResults] = useState<FanoutResults | null>(null)
@@ -74,6 +74,10 @@ export default function FanoutPage() {
   const [sequentialTiming, setSequentialTiming] = useState<SequentialTiming | null>(null)
   const [expandedSeqLevel, setExpandedSeqLevel] = useState<number | null>(null)
   const [isSequential, setIsSequential] = useState(false)
+  const [isCleaning, setIsCleaning] = useState(false)
+  const [isDeletingRecords, setIsDeletingRecords] = useState(false)
+  const [isRecordsDeleted, setIsRecordsDeleted] = useState(false)
+  const [isCleared, setIsCleared] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const stopPolling = () => {
@@ -83,31 +87,17 @@ export default function FanoutPage() {
     }
   }
 
-  const fetchResults = useCallback(async (jobId: string, query: string) => {
+  const fetchResults = useCallback(async (jobId: string) => {
     const res = await axios.get<FanoutResults>(
       `http://localhost:5000/api/fanout/results/${jobId}`
     )
     if (res.status === 200) {
       setResults(res.data)
       stopPolling()
-
-      // Now run the same query sequentially for comparison
-      setIsSequential(true)
-      try {
-        const seqRes = await axios.post<SequentialTiming>(
-          'http://localhost:5000/api/fanout/sequential',
-          { query }
-        )
-        setSequentialTiming(seqRes.data)
-      } catch {
-        // sequential is best-effort — don't block UI
-      } finally {
-        setIsSequential(false)
-      }
     }
   }, [])
 
-  const pollStatus = useCallback((jobId: string, query: string) => {
+  const pollStatus = useCallback((jobId: string) => {
     pollRef.current = setInterval(async () => {
       try {
         const res = await axios.get<JobStatus>(
@@ -116,7 +106,7 @@ export default function FanoutPage() {
         setStatus(res.data)
         if (res.data.done) {
           stopPolling()
-          await fetchResults(jobId, query)
+          await fetchResults(jobId)
         }
       } catch {
         stopPolling()
@@ -126,24 +116,37 @@ export default function FanoutPage() {
   }, [fetchResults])
 
   const handleStart = useCallback(async () => {
-    if (!query.trim()) return
+    if (!region.trim()) return
     setIsStarting(true)
     setError(null)
     setStatus(null)
     setResults(null)
     setRootJobId(null)
     setSequentialTiming(null)
+    setIsCleared(false)
+    setIsRecordsDeleted(false)
     stopPolling()
 
     try {
+      // Step 1 — sequential baseline first so parallel runs on warm connections
+      setIsSequential(true)
+      const seqRes = await axios.post<SequentialTiming>(
+        'http://localhost:5000/api/fanout/sequential',
+        { region: region.trim() || 'US' }
+      )
+      setSequentialTiming(seqRes.data)
+      setIsSequential(false)
+
+      // Step 2 — now run parallel fan-out
       const res = await axios.post<{ rootJobId: string }>(
         'http://localhost:5000/api/fanout/start',
-        { query: query.trim() }
+        { region: region.trim() || 'US' }
       )
       const jobId = res.data.rootJobId
       setRootJobId(jobId)
-      pollStatus(jobId, query.trim())
+      pollStatus(jobId)
     } catch (err) {
+      setIsSequential(false)
       if (axios.isAxiosError(err)) {
         setError(err.code === 'ERR_NETWORK'
           ? 'Cannot connect to backend on port 5000.'
@@ -154,7 +157,32 @@ export default function FanoutPage() {
     } finally {
       setIsStarting(false)
     }
-  }, [query, pollStatus])
+  }, [region, pollStatus])
+
+  const handleCleanup = useCallback(async () => {
+    if (!rootJobId) return
+    setIsCleaning(true)
+    try {
+      await axios.delete(`http://localhost:5000/api/fanout/cleanup/${rootJobId}`)
+      setIsCleared(true)
+    } catch {
+      // ignore cleanup errors
+    } finally {
+      setIsCleaning(false)
+    }
+  }, [rootJobId])
+
+  const handleDeleteRecords = useCallback(async () => {
+    setIsDeletingRecords(true)
+    try {
+      await axios.delete('http://localhost:5000/api/fanout/records')
+      setIsRecordsDeleted(true)
+    } catch {
+      // ignore errors
+    } finally {
+      setIsDeletingRecords(false)
+    }
+  }, [])
 
   // Group results by depth
   const byDepth = results
@@ -208,9 +236,8 @@ export default function FanoutPage() {
       <div className="border-b border-[#0e0e0e] bg-[#090909] flex-shrink-0">
         <div className="max-w-[1400px] mx-auto px-6 py-3">
           <p className="text-xs text-[#484848] leading-relaxed max-w-3xl">
-            Recursive fan-out using BullMQ. Level 1 searches for the query and resolves symbols.
-            Level 2 fetches chart data for each symbol in parallel — all managed by a job queue with
-            concurrency control, retries, and rate limiting.
+            Recursive fan-out using BullMQ. Level 1 (Trending) resolves the region to trending symbols.
+            Level 2 runs in parallel: Chart for each trending symbol + Market Summary for the region — all leaf nodes.
           </p>
         </div>
       </div>
@@ -226,25 +253,25 @@ export default function FanoutPage() {
               <h2 className="text-xs font-semibold text-[#888] uppercase tracking-widest">Parameters</h2>
             </div>
 
-            {/* Query input */}
+            {/* Region input */}
             <div className="mb-4">
-              <label className="block text-xs font-medium text-[#666] mb-1.5">Query</label>
+              <label className="block text-xs font-medium text-[#666] mb-1.5">Region</label>
               <input
                 type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g. Apple, TSLA, Microsoft"
+                value={region}
+                onChange={(e) => setRegion(e.target.value)}
+                placeholder="e.g. US, GB, IN"
                 className="w-full bg-[#111] border border-[#1e1e1e] rounded-lg px-3 py-2 text-sm text-[#e5e5e5] placeholder-[#333] focus:outline-none focus:border-[#333]"
               />
               <p className="text-[10px] text-[#444] mt-1.5">
-                Company name or ticker — resolved to symbol at Level 1
+                Level 1 fetches trending symbols for this region
               </p>
             </div>
 
             {/* Start button */}
             <button
               onClick={handleStart}
-              disabled={isStarting || (!results && !!rootJobId && !status?.done)}
+              disabled={isSequential || isStarting || (!results && !!rootJobId && !status?.done)}
               className="w-full py-2.5 rounded-lg text-xs font-semibold transition-all"
               style={{
                 background: ACCENT,
@@ -252,12 +279,44 @@ export default function FanoutPage() {
                 opacity: (isStarting || (!results && !!rootJobId && !status?.done)) ? 0.5 : 1,
               }}
             >
-              {isStarting
-                ? 'Starting...'
+              {isSequential
+                ? 'Running Sequential...'
                 : rootJobId && !status?.done
-                ? 'Running...'
+                ? 'Running Parallel...'
                 : 'Start Fan-out'}
             </button>
+
+            {/* Clear Redis + Delete MongoDB buttons — shown after processing is done */}
+            {(results || isCleared) && (
+              <div className="mt-2 flex flex-col gap-2">
+                <button
+                  onClick={handleCleanup}
+                  disabled={isCleaning || isCleared}
+                  className="w-full py-2 rounded-lg text-xs font-semibold border transition-all"
+                  style={{
+                    color: (isCleaning || isCleared) ? '#444' : '#f87171',
+                    borderColor: (isCleaning || isCleared) ? '#1e1e1e' : '#f8717125',
+                    background: 'transparent',
+                    opacity: (isCleaning || isCleared) ? 0.5 : 1,
+                  }}
+                >
+                  {isCleaning ? 'Clearing...' : isCleared ? 'Redis Cleared' : 'Clear Redis Queue'}
+                </button>
+                <button
+                  onClick={handleDeleteRecords}
+                  disabled={isDeletingRecords || isRecordsDeleted}
+                  className="w-full py-2 rounded-lg text-xs font-semibold border transition-all"
+                  style={{
+                    color: (isDeletingRecords || isRecordsDeleted) ? '#444' : '#fb923c',
+                    borderColor: (isDeletingRecords || isRecordsDeleted) ? '#1e1e1e' : '#fb923c25',
+                    background: 'transparent',
+                    opacity: (isDeletingRecords || isRecordsDeleted) ? 0.5 : 1,
+                  }}
+                >
+                  {isDeletingRecords ? 'Deleting...' : isRecordsDeleted ? 'Records Deleted' : 'Delete MongoDB Records'}
+                </button>
+              </div>
+            )}
 
             {/* Status section */}
             {rootJobId && (
@@ -400,17 +459,6 @@ export default function FanoutPage() {
                   </div>
                 )}
 
-                {/* Sequential timing breakdown */}
-                {isSequential && (
-                  <div className="bg-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-3">
-                    <p className="text-[9px] text-[#444] uppercase tracking-wide mb-2">Sequential (running...)</p>
-                    <div className="flex items-center gap-2">
-                      <div className="w-3 h-3 rounded-full border border-t-transparent animate-spin" style={{ borderColor: '#60a5fa40', borderTopColor: '#60a5fa' }} />
-                      <span className="text-[9px] text-[#444]">Running same calls one by one...</span>
-                    </div>
-                  </div>
-                )}
-
                 {sequentialTiming && (
                   <div className="bg-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-3 space-y-3">
                     <p className="text-[9px] text-[#444] uppercase tracking-wide">Sequential Breakdown</p>
@@ -499,7 +547,7 @@ export default function FanoutPage() {
                 )}
 
                 {/* Empty state */}
-                {!error && !rootJobId && (
+                {!error && !isSequential && !rootJobId && (
                   <div className="h-full flex flex-col items-center justify-center gap-2">
                     <div className="w-12 h-12 rounded-full border border-[#1a1a1a] flex items-center justify-center">
                       <svg className="w-5 h-5 text-[#2a2a2a]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -510,7 +558,18 @@ export default function FanoutPage() {
                   </div>
                 )}
 
-                {/* Polling — waiting for results */}
+                {/* Phase 1 — Sequential baseline running */}
+                {!error && isSequential && (
+                  <div className="h-full flex flex-col items-center justify-center gap-3">
+                    <div
+                      className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin"
+                      style={{ borderColor: '#60a5fa40', borderTopColor: '#60a5fa' }}
+                    />
+                    <p className="text-xs text-[#444]">Phase 1 — Running sequential baseline...</p>
+                  </div>
+                )}
+
+                {/* Phase 2 — Parallel fan-out running */}
                 {!error && rootJobId && !results && (
                   <div className="h-full flex flex-col items-center justify-center gap-3">
                     <div
@@ -518,7 +577,7 @@ export default function FanoutPage() {
                       style={{ borderColor: `${ACCENT}40`, borderTopColor: ACCENT }}
                     />
                     <p className="text-xs text-[#444]">
-                      Processing jobs... {status ? `${status.completed}/${status.total}` : ''}
+                      Phase 2 — Running parallel fan-out... {status ? `${status.completed}/${status.total}` : ''}
                     </p>
                   </div>
                 )}

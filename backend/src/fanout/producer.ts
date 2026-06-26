@@ -2,27 +2,38 @@ import { fanoutQueue } from './queue';
 import { incrementTotal, setStartTime } from './aggregator';
 import { FanoutJobPayload } from './types';
 
-// Kicks off the entire fan-out tree from a root query
-export async function startFanout(query: string): Promise<string> {
-  const rootJobId = `root-${Date.now()}-${query.replace(/\s+/g, '_')}`;
+export async function startFanout(region: string): Promise<string> {
+  const rootJobId = `root-${Date.now()}-${region.replace(/\s+/g, '_')}`;
 
-  const payload: FanoutJobPayload = {
-    key:          query,
-    depth:        1,
-    parentJobId:  null,
+  const trendingPayload: FanoutJobPayload = {
+    key:         region,
+    depth:       1,
+    jobType:     'trending',
+    parentJobId: null,
     rootJobId,
-    path:         [],
+    path:        [],
+    region,
   };
 
-  // Register 1 job in the total counter and record start time
+  const marketSummaryPayload: FanoutJobPayload = {
+    key:         region,
+    depth:       1,
+    jobType:     'marketSummary',
+    parentJobId: null,
+    rootJobId,
+    path:        [],
+    region,
+  };
+
   await Promise.all([
-    incrementTotal(rootJobId, 1),
+    incrementTotal(rootJobId, 2),
     setStartTime(rootJobId),
   ]);
 
-  await (fanoutQueue as any).add(`fanout » ${query}`, payload, {
-    jobId: rootJobId,
-  });
+  await (fanoutQueue as any).addBulk([
+    { name: `fanout » trending:${region}`,      data: trendingPayload },
+    { name: `fanout » marketSummary:${region}`, data: marketSummaryPayload },
+  ]);
 
   return rootJobId;
 }

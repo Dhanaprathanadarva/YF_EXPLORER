@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { JobType } from './types';
 
 const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -18,26 +19,32 @@ async function fetchYF(url: string, params: Record<string, string>) {
   return response.data;
 }
 
-export interface LevelResponse {
-  data: unknown
-  children: { key: string; data: unknown }[]  // empty = leaf, no further jobs
+export interface ChildJob {
+  key: string;
+  jobType: JobType;
+  data?: unknown;
 }
 
-// Level 1 — Search: query → symbols (children become Level 2 jobs)
-async function fetchLevel1(query: string): Promise<LevelResponse> {
+export interface LevelResponse {
+  data: unknown
+  children: ChildJob[]  // empty = leaf, no further jobs
+}
+
+// Level 1 — Trending: region → trending symbols (Level 2 Chart jobs) + MarketSummary branch
+async function fetchTrending(region: string): Promise<LevelResponse> {
   const data = await fetchYF(
-    'https://query1.finance.yahoo.com/v1/finance/search',
-    { q: query, lang: 'en-US', region: 'US', quotesCount: '5', newsCount: '0' }
+    `https://query1.finance.yahoo.com/v1/finance/trending/${encodeURIComponent(region)}`,
+    { lang: 'en-US', region }
   );
-  const quotes: { symbol: string }[] = data?.quotes ?? [];
+  const quotes: { symbol: string }[] = data?.finance?.result?.[0]?.quotes ?? [];
   return {
     data,
-    children: quotes.map((q) => ({ key: q.symbol, data: q })),
+    children: quotes.map((q) => ({ key: q.symbol, jobType: 'chart' as JobType })),
   };
 }
 
-// Level 2 — Chart: symbol → OHLCV data, leaf node (children: [] stops recursion)
-async function fetchLevel2(symbol: string): Promise<LevelResponse> {
+// Level 2 — Chart: symbol → OHLCV data, leaf node
+async function fetchChart(symbol: string): Promise<LevelResponse> {
   const data = await fetchYF(
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`,
     { interval: '1d', range: '1mo', lang: 'en-US', region: 'US' }
@@ -45,9 +52,19 @@ async function fetchLevel2(symbol: string): Promise<LevelResponse> {
   return { data, children: [] };
 }
 
-// Dispatcher — called by the worker based on current depth
-export async function fetchNextLevel(key: string, depth: number): Promise<LevelResponse> {
-  if (depth === 1) return fetchLevel1(key);
-  if (depth === 2) return fetchLevel2(key);
+// Level 2 — Market Summary: region → market snapshot, leaf node
+async function fetchMarketSummary(region: string): Promise<LevelResponse> {
+  const data = await fetchYF(
+    'https://query1.finance.yahoo.com/v6/finance/quote/marketSummary',
+    { lang: 'en-US', region }
+  );
+  return { data, children: [] };
+}
+
+// Dispatcher — called by the worker based on jobType
+export async function fetchNextLevel(key: string, jobType: JobType, region: string): Promise<LevelResponse> {
+  if (jobType === 'trending')      return fetchTrending(key);
+  if (jobType === 'chart')         return fetchChart(key);
+  if (jobType === 'marketSummary') return fetchMarketSummary(key);
   return { data: null, children: [] };
 }
